@@ -47,6 +47,7 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 		if err != nil {
 			return err
 		}
+		conn.SetMaxOpenConns(1)
 		db.ConnPool = conn
 	}
 
