@@ -105,6 +105,61 @@ func (m Migrator) AlterColumn(value interface{}, name string) error {
 	})
 }
 
+// MigrateColumn migrates a column.
+//
+// SQLite cannot ALTER a column in place: any column change rebuilds the whole table
+// (create __temp -> copy every row -> drop -> rename). GORM's default MigrateColumn also
+// compares size, precision, default value, nullability and comment. This driver does not
+// round-trip all of those faithfully (for example a parenthesized default such as
+// DEFAULT (CURRENT_TIMESTAMP) is read back without its opening parenthesis), so the default
+// implementation can decide to "alter" the column on EVERY startup and rebuild the table each
+// time - which gets slower as the table grows.
+//
+// To avoid that, only rebuild the table when the base data type actually changed. Missing
+// columns are still added by AutoMigrate, and unique constraints are still reconciled.
+func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {
+	if field.IgnoreMigration {
+		return nil
+	}
+
+	if !field.PrimaryKey && m.baseTypeChanged(field, columnType) {
+		return m.AlterColumn(value, field.DBName)
+	}
+
+	return m.MigrateColumnUnique(value, field, columnType)
+}
+
+func (m Migrator) baseTypeChanged(field *schema.Field, columnType gorm.ColumnType) bool {
+	return normalizeSqliteType(m.DataTypeOf(field)) != normalizeSqliteType(columnType.DatabaseTypeName())
+}
+
+// normalizeSqliteType maps a raw column type to its canonical SQLite type affinity so that
+// equivalent types (varchar/text, int/integer, bool/numeric, timestamp/datetime, ...) compare
+// equal. Only the first token is considered, so size/precision suffixes are ignored.
+func normalizeSqliteType(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.IndexAny(s, " (\t"); i >= 0 {
+		s = s[:i]
+	}
+
+	switch s {
+	case "text", "varchar", "char", "nvarchar", "nchar", "clob", "character":
+		return "text"
+	case "integer", "int", "bigint", "smallint", "tinyint", "mediumint", "int2", "int8":
+		return "integer"
+	case "real", "float", "double", "precision":
+		return "real"
+	case "numeric", "decimal", "bool", "boolean":
+		return "numeric"
+	case "blob":
+		return "blob"
+	case "datetime", "timestamp", "date", "time":
+		return "datetime"
+	default:
+		return s
+	}
+}
+
 // ColumnTypes return columnTypes []gorm.ColumnType and execErr error
 func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {
 	columnTypes := make([]gorm.ColumnType, 0)
