@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"strconv"
+	"strings"
 
 	"gorm.io/gorm/callbacks"
 
@@ -194,10 +195,23 @@ func (dialector Dialector) QuoteTo(writer clause.Writer, str string) {
 }
 
 func (dialector Dialector) Explain(sql string, vars ...interface{}) string {
-	return logger.ExplainSQL(sql, nil, `"`, vars...)
+	// SQLite (like Postgres/DuckDB) treats 'single quotes' as string literals and
+	// "double quotes" as identifiers. String-column DEFAULTs are rendered through
+	// this escaper, so using `"` produces `DEFAULT "x"` — only accepted via
+	// SQLite's double-quoted-string compatibility quirk, and incorrect elsewhere.
+	// Use `'` for proper string literals.
+	return logger.ExplainSQL(sql, nil, `'`, vars...)
 }
 
 func (dialector Dialector) DataTypeOf(field *schema.Field) string {
+	// SQLite has no ENUM type. An inline enum('a','b',...) tag (kept on the model
+	// so MySQL/DuckDB get a native/constraint enum) would otherwise be emitted
+	// verbatim as the column type, which is a syntax error in SQLite DDL
+	// ("near 'a': syntax error"). Degrade to TEXT; enum membership is enforced at
+	// the application layer on SQLite.
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(string(field.DataType))), "enum(") {
+		return "text"
+	}
 	switch field.DataType {
 	case schema.Bool:
 		return "numeric"
