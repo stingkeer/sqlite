@@ -26,10 +26,59 @@ type Dialector struct {
 	DriverName string
 	DSN        string
 	Conn       gorm.ConnPool
+	// MaxOpenConns caps the number of open database connections. The zero value
+	// keeps the historical default of 1 (fully serialized). Raise it above 1 to
+	// let WAL-mode reads run concurrently with a writer.
+	MaxOpenConns int
 }
 
 func Open(dsn string) gorm.Dialector {
 	return &Dialector{DSN: dsn}
+}
+
+// applyDefaultPragmas appends sensible SQLite PRAGMA defaults to the DSN via the
+// modernc.org/sqlite `_pragma=` query parameter, but only for pragmas the caller
+// has not already set. User-provided pragmas always win.
+//
+// journal_mode=WAL lets readers and a single writer coexist; synchronous=NORMAL
+// is crash-safe under WAL and avoids an fsync per commit; busy_timeout=5000 makes
+// lock contention wait instead of failing at once. These are connection-level
+// pragmas, so they must ride the DSN (executed per pooled connection), not a
+// one-shot Exec.
+func applyDefaultPragmas(dsn string) string {
+	lower := strings.ToLower(dsn)
+	var pragmas []string
+	if !strings.Contains(lower, "journal_mode") {
+		pragmas = append(pragmas, "journal_mode(WAL)")
+	}
+	if !strings.Contains(lower, "synchronous") {
+		pragmas = append(pragmas, "synchronous(NORMAL)")
+	}
+	if !strings.Contains(lower, "busy_timeout") {
+		pragmas = append(pragmas, "busy_timeout(5000)")
+	}
+	// modernc.org/sqlite defaults its time.Time serialization to t.String()
+	// (e.g. "2026-07-30 22:30:26.123 +0800 CST m=+..."), which SQLite strftime
+	// cannot parse. _time_format=sqlite writes a standard offset datetime
+	// ("2006-01-02 15:04:05.999999999-07:00") that strftime understands.
+	needTimeFormat := !strings.Contains(lower, "_time_format")
+
+	if len(pragmas) == 0 && !needTimeFormat {
+		return dsn
+	}
+
+	parts := make([]string, 0, len(pragmas)+1)
+	for _, p := range pragmas {
+		parts = append(parts, "_pragma="+p)
+	}
+	if needTimeFormat {
+		parts = append(parts, "_time_format=sqlite")
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + strings.Join(parts, "&")
 }
 
 func (dialector Dialector) Name() string {
@@ -44,11 +93,15 @@ func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
 	if dialector.Conn != nil {
 		db.ConnPool = dialector.Conn
 	} else {
-		conn, err := sql.Open(dialector.DriverName, dialector.DSN)
+		conn, err := sql.Open(dialector.DriverName, applyDefaultPragmas(dialector.DSN))
 		if err != nil {
 			return err
 		}
-		conn.SetMaxOpenConns(1)
+		maxOpen := dialector.MaxOpenConns
+		if maxOpen <= 0 {
+			maxOpen = 5
+		}
+		conn.SetMaxOpenConns(maxOpen)
 		db.ConnPool = conn
 	}
 
